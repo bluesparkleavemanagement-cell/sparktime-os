@@ -31,8 +31,8 @@ const INITIAL_EMPLOYEES = [
   { id: 3, name: "Priya Patel",      email: "priya@company.com",   dept: "Marketing",   role: "employee", avatar: "PP", managerId: 6, title: "Marketing Lead" },
   { id: 4, name: "James O'Brien",    email: "james@company.com",   dept: "Engineering", role: "employee", avatar: "JO", managerId: 5, title: "Engineer" },
   { id: 5, name: "Elena Rodriguez",  email: "elena@company.com",   dept: "Engineering", role: "manager",  avatar: "ER", managerId: 7, title: "Eng Manager" },
-  { id: 6, name: "Renadel Molina",        email: "renadel.molina@bluesparkph.com",   dept: "Operations",  role: "manager",  avatar: "DK", managerId: 7, title: "Ops Manager" },
-  { id: 7, name: "Ana Isla",    email: "afb.isla@bluesparkph.com",    dept: "Executive",   role: "admin",    avatar: "AI", managerId: null, title: "CEO" },
+  { id: 6, name: "Renadel Molina",   email: "renadel.molina@bluesparkph.com", dept: "Operations", role: "manager", avatar: "RM", managerId: 7, title: "Ops Manager" },
+  { id: 7, name: "Ana Isla",          email: "afb.isla@bluesparkph.com",       dept: "Executive",  role: "admin",   avatar: "AI", managerId: null, title: "CEO" },
 ];
 
 const LEAVE_TYPES = ["Vacation Leave", "Sick Leave", "Offset", "Bereavement Leave", "Emergency Leave", "Parental Leave (Maternity or Paternity)"];
@@ -658,7 +658,7 @@ export default function App() {
           <div style={{ margin: "0 12px 18px", background: "rgba(255,255,255,0.05)", borderRadius: 12, padding: 12 }}>
             <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 9, fontFamily: "'DM Mono', monospace", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1.5 }}>Signed in as</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-              <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#4285F4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff", flexShrink: 0 }}>{currentUser.avatar}</div>
+              <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#4285F4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff", flexShrink: 0 }}>{currentUser.avatar || currentUser.name?.slice(0,2).toUpperCase()}</div>
               <div>
                 <div style={{ color: "#fff", fontSize: 12, fontWeight: 600 }}>{currentUser.name}</div>
                 <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 10, fontFamily: "'DM Mono', monospace" }}>{currentUser.role}</div>
@@ -1117,7 +1117,7 @@ export default function App() {
                       {[["Full Name", "name", "text"], ["Email", "email", "email"], ["Department", "dept", "text"], ["Job Title", "title", "text"]].map(([label, key, type]) => (
                         <div key={key}>
                           <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{label}</label>
-                          <input type={type} value={empForm[key]} onChange={e => setEmpForm(f => ({ ...f, [key]: e.target.value }))} style={S.inputBase} placeholder={label} />
+                          <input type={type} value={empForm[key] ?? ''} onChange={e => setEmpForm(f => ({ ...f, [key]: e.target.value }))} style={S.inputBase} placeholder={label} />
                         </div>
                       ))}
                       <div>
@@ -1165,7 +1165,7 @@ export default function App() {
                     const manager = employees.find(e => e.id === emp.managerId);
                     return (
                       <div key={emp.id} className="row-hover" style={{ padding: "16px 24px", borderBottom: i < employees.length - 1 ? "1px solid #f6f6f6" : "none", display: "flex", alignItems: "center", gap: 14 }}>
-                        <Avatar initials={emp.avatar} size={40} />
+                        <Avatar initials={emp.avatar || emp.name?.slice(0,2).toUpperCase() || "??"} size={40} />
                         <div style={{ flex: 1 }}>
                           <div style={{ fontWeight: 600, fontSize: 14 }}>{emp.name}</div>
                           <div style={{ fontSize: 12, color: "#888", marginTop: 2 }}>{emp.title} · {emp.dept}</div>
