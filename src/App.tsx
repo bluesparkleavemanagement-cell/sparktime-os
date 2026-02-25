@@ -20,7 +20,7 @@ const EMAILJS_CONFIG = {
 const GOOGLE_CONFIG = {
   CLIENT_ID: "874104965970-3of64vaml2pkksegobmhd1p02uo57apd.apps.googleusercontent.com",
 
-  SCOPES: "https://www.googleapis.com/auth/calendar.events",
+  SCOPES: "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
   MOCK_MODE: false, // Set to false once credentials are ready
 };
 
@@ -129,21 +129,34 @@ async function notifyEmployee(employee, manager, request, status, note) {
 
 // ─── GOOGLE CALENDAR (OAUTH) ───────────────────────────────────────────────────
 // Loads the Google Identity Services + gapi scripts dynamically
+let gapiReady = false;
 function loadGoogleScripts() {
-  return new Promise((resolve) => {
-    if (window.google && window.gapi) return resolve();
-    const gsi = document.createElement("script");
-    gsi.src = "https://accounts.google.com/gsi/client";
-    gsi.onload = () => {
-      const gapi = document.createElement("script");
-      gapi.src = "https://apis.google.com/js/api.js";
-      gapi.onload = () => window.gapi.load("client", () => {
-        window.gapi.client.init({ discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"] })
-          .then(resolve);
+  return new Promise((resolve, reject) => {
+    if (gapiReady) return resolve();
+    // Load Google Identity Services
+    const loadGsi = () => new Promise(res => {
+      if (window.google?.accounts) return res();
+      const s = document.createElement("script");
+      s.src = "https://accounts.google.com/gsi/client";
+      s.onload = res;
+      s.onerror = () => reject(new Error("Failed to load Google Identity Services"));
+      document.body.appendChild(s);
+    });
+    // Load GAPI and initialize Calendar client
+    const loadGapi = () => new Promise(res => {
+      if (window.gapi?.client?.calendar) return res();
+      const s = document.createElement("script");
+      s.src = "https://apis.google.com/js/api.js";
+      s.onload = () => window.gapi.load("client", () => {
+        window.gapi.client
+          .init({ discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"] })
+          .then(() => { gapiReady = true; res(); })
+          .catch(reject);
       });
-      document.body.appendChild(gapi);
-    };
-    document.body.appendChild(gsi);
+      s.onerror = () => reject(new Error("Failed to load GAPI"));
+      document.body.appendChild(s);
+    });
+    loadGsi().then(loadGapi).then(resolve).catch(reject);
   });
 }
 
@@ -286,11 +299,95 @@ export default function App() {
   const [selectedEmpId, setSelectedEmpId] = useState(null);
   const [empBalanceDraft, setEmpBalanceDraft] = useState({});
   const [empBalanceSaved, setEmpBalanceSaved] = useState(false);
-  const [form, setForm] = useState({ type: "Annual Leave", start: "", end: "", reason: "" });
+  const [form, setForm] = useState({ type: "Vacation Leave", start: "", end: "", reason: "" });
+  const [loggedInUser, setLoggedInUser] = useState(null); // null = not logged in
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  // ── GOOGLE SIGN IN ──
+  const handleGoogleSignIn = useCallback(async () => {
+    setAuthLoading(true);
+    setAuthError("");
+    try {
+      // Load GSI script
+      await new Promise((resolve, reject) => {
+        if (window.google?.accounts) return resolve();
+        const s = document.createElement("script");
+        s.src = "https://accounts.google.com/gsi/client";
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("Failed to load Google Sign-In"));
+        document.body.appendChild(s);
+      });
+
+      // Get ID token via Google One Tap / popup
+      const credential = await new Promise((resolve, reject) => {
+        window.google.accounts.id.initialize({
+          client_id: GOOGLE_CONFIG.CLIENT_ID,
+          callback: (response) => response.credential ? resolve(response.credential) : reject(new Error("No credential")),
+          auto_select: false,
+          cancel_on_tap_outside: true,
+        });
+        window.google.accounts.id.prompt((notification) => {
+          if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+            // Fallback: use OAuth popup to get email
+            const client = window.google.accounts.oauth2.initTokenClient({
+              client_id: GOOGLE_CONFIG.CLIENT_ID,
+              scope: "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
+              callback: async (resp) => {
+                if (resp.error) return reject(new Error(resp.error));
+                // Fetch user info with token
+                try {
+                  const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+                    headers: { Authorization: `Bearer ${resp.access_token}` }
+                  });
+                  const info = await res.json();
+                  const matched = INITIAL_EMPLOYEES.find(e => e.email.toLowerCase() === info.email?.toLowerCase());
+                  if (!matched) {
+                    setAuthError(`No account found for ${info.email}. Contact your admin.`);
+                    setAuthLoading(false);
+                    return;
+                  }
+                  setLoggedInUser(matched);
+                  setCurrentUser(matched);
+                  setAuthLoading(false);
+                } catch { reject(new Error("Failed to fetch user info")); }
+              },
+            });
+            client.requestAccessToken({ prompt: "select_account" });
+          }
+        });
+      });
+
+      // Decode JWT credential if One Tap succeeded
+      if (credential) {
+        const payload = JSON.parse(atob(credential.split(".")[1]));
+        const email = payload.email;
+        const matched = employees.find(e => e.email.toLowerCase() === email.toLowerCase());
+        if (!matched) {
+          setAuthError(`No account found for ${email}. Contact your admin.`);
+          setAuthLoading(false);
+          return;
+        }
+        setLoggedInUser(matched);
+        setCurrentUser(matched);
+      }
+    } catch (err) {
+      console.error("Sign-in error:", err);
+      setAuthError("Sign-in failed. Please try again.");
+    }
+    setAuthLoading(false);
+  }, [employees]);
+
+  const handleSignOut = useCallback(() => {
+    setLoggedInUser(null);
+    setCurrentUser(INITIAL_EMPLOYEES[0]);
+    setView("dashboard");
+    if (window.google?.accounts?.id) window.google.accounts.id.disableAutoSelect();
   }, []);
 
   const saveEntitlements = useCallback(() => {
@@ -436,8 +533,54 @@ export default function App() {
     { id: "calendar",  label: "Calendar",   icon: "⬡" },
     { id: "org",       label: "Organization", icon: "◉" },
     ...(isManager ? [{ id: "approvals", label: `Approvals${pendingForMe.length > 0 ? ` (${pendingForMe.length})` : ""}`, icon: "◎" }] : []),
-    ...(isAdmin   ? [{ id: "orgchart",  label: "Org Chart Builder", icon: "⬡" }, { id: "entitlements", label: "Leave Entitlements", icon: "◇" }] : []),
+    ...(isAdmin   ? [{ id: "employees", label: "Employees", icon: "◫" }, { id: "orgchart",  label: "Org Chart Builder", icon: "⬡" }, { id: "entitlements", label: "Leave Entitlements", icon: "◇" }] : []),
   ];
+
+  // ── LOGIN SCREEN ──
+  if (!loggedInUser) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Instrument Sans', sans-serif" }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap');`}</style>
+        <div style={{ width: 400, textAlign: "center" }}>
+          {/* Logo */}
+          <div style={{ marginBottom: 40 }}>
+            <div style={{ fontFamily: "'DM Mono', monospace", color: "#fff", fontSize: 28, fontWeight: 500, letterSpacing: "-1px" }}>SparkTime OS</div>
+            <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 12, marginTop: 6, fontFamily: "'DM Mono', monospace" }}>Enterprise Leave Management</div>
+          </div>
+
+          {/* Sign-in card */}
+          <div style={{ background: "#fff", borderRadius: 24, padding: "40px 36px", boxShadow: "0 24px 64px rgba(0,0,0,0.4)" }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color: "#1a1a2e", marginBottom: 8 }}>Welcome back</div>
+            <div style={{ fontSize: 14, color: "#888", marginBottom: 32 }}>Sign in with your company Google account to continue</div>
+
+            {authError && (
+              <div style={{ background: "#fce8e6", color: "#d93025", borderRadius: 10, padding: "12px 16px", fontSize: 13, marginBottom: 20, textAlign: "left" }}>
+                {authError}
+              </div>
+            )}
+
+            <button
+              onClick={handleGoogleSignIn}
+              disabled={authLoading}
+              style={{ width: "100%", padding: "14px 20px", borderRadius: 12, border: "1.5px solid #e0e0e0", background: authLoading ? "#f5f5f5" : "#fff", cursor: authLoading ? "wait" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 12, fontSize: 15, fontWeight: 600, color: "#1a1a2e", transition: "all 0.2s", boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
+              {authLoading ? (
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 13 }}>Signing in...</span>
+              ) : (
+                <>
+                  <svg width="20" height="20" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+                  Sign in with Google
+                </>
+              )}
+            </button>
+
+            <div style={{ marginTop: 24, fontSize: 12, color: "#bbb", lineHeight: 1.6 }}>
+              Only company email addresses are accepted.<br />Contact your admin if you can't sign in.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: "#f3f4f6", fontFamily: "'Instrument Sans', sans-serif" }}>
@@ -511,13 +654,19 @@ export default function App() {
             <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, marginTop: 2, fontFamily: "'DM Mono', monospace" }}>Enterprise · v2.0</div>
           </div>
 
-          {/* User switcher */}
+          {/* Logged-in user display */}
           <div style={{ margin: "0 12px 18px", background: "rgba(255,255,255,0.05)", borderRadius: 12, padding: 12 }}>
-            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 9, fontFamily: "'DM Mono', monospace", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1.5 }}>Viewing As</div>
-            <select value={currentUser.id} onChange={e => { setCurrentUser(employees.find(emp => emp.id === parseInt(e.target.value))); setView("dashboard"); }}
-              style={{ width: "100%", background: "transparent", border: "none", color: "#fff", fontSize: 12, fontFamily: "'DM Mono', monospace", cursor: "pointer", outline: "none" }}>
-              {employees.map(e => <option key={e.id} value={e.id} style={{ background: "#1a1a2e" }}>{e.name} ({e.role})</option>)}
-            </select>
+            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 9, fontFamily: "'DM Mono', monospace", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1.5 }}>Signed in as</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#4285F4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff", flexShrink: 0 }}>{currentUser.avatar}</div>
+              <div>
+                <div style={{ color: "#fff", fontSize: 12, fontWeight: 600 }}>{currentUser.name}</div>
+                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 10, fontFamily: "'DM Mono', monospace" }}>{currentUser.role}</div>
+              </div>
+            </div>
+            <button onClick={handleSignOut} style={{ width: "100%", background: "rgba(255,255,255,0.07)", border: "none", borderRadius: 8, padding: "6px 0", color: "rgba(255,255,255,0.5)", fontSize: 11, fontFamily: "'DM Mono', monospace", cursor: "pointer" }}>
+              Sign out
+            </button>
           </div>
 
           {/* Nav */}
@@ -530,11 +679,11 @@ export default function App() {
             ))}
           </nav>
 
-          {/* GCal mock notice */}
+          {/* GCal notice */}
           <div style={{ margin: "0 12px 20px", background: "rgba(66,133,244,0.12)", border: "1px solid rgba(66,133,244,0.2)", borderRadius: 10, padding: "10px 12px" }}>
             <div style={{ fontSize: 10, color: "rgba(255,255,255,0.6)", fontFamily: "'DM Mono', monospace", lineHeight: 1.5 }}>
               📅 Google Calendar<br />
-              <span style={{ color: "rgba(255,255,255,0.35)" }}>Mock mode · Add credentials to activate</span>
+              <span style={{ color: "rgba(255,255,255,0.35)" }}>Sign in with Google when syncing</span>
             </div>
           </div>
         </div>
@@ -945,6 +1094,103 @@ export default function App() {
                     })()}
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* ── EMPLOYEE MANAGEMENT (Admin only) ── */}
+            {view === "employees" && isAdmin && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 26 }}>
+                  <div>
+                    <div style={S.sectionLabel}>Admin Panel</div>
+                    <h1 style={S.pageTitle}>Employee Management</h1>
+                    <p style={{ color: "#888", fontSize: 14, marginTop: 4 }}>{employees.length} employees · Add, edit, or remove team members</p>
+                  </div>
+                  <button onClick={() => { setShowEmpForm(true); setEditingEmpId(null); setEmpForm({ name: "", email: "", dept: "", title: "", role: "employee", managerId: "" }); }} style={S.btnDark} className="btn-anim">+ Add Employee</button>
+                </div>
+
+                {/* Add/Edit Form */}
+                {showEmpForm && (
+                  <div style={{ ...S.card, padding: 28, marginBottom: 24 }} className="fade-up">
+                    <div style={{ fontWeight: 700, fontSize: 15, fontFamily: "'DM Mono', monospace", marginBottom: 20 }}>{editingEmpId ? "Edit Employee" : "New Employee"}</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+                      {[["Full Name", "name", "text"], ["Email", "email", "email"], ["Department", "dept", "text"], ["Job Title", "title", "text"]].map(([label, key, type]) => (
+                        <div key={key}>
+                          <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{label}</label>
+                          <input type={type} value={empForm[key]} onChange={e => setEmpForm(f => ({ ...f, [key]: e.target.value }))} style={S.inputBase} placeholder={label} />
+                        </div>
+                      ))}
+                      <div>
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Role</label>
+                        <select value={empForm.role} onChange={e => setEmpForm(f => ({ ...f, role: e.target.value }))} style={S.inputBase}>
+                          <option value="employee">Employee</option>
+                          <option value="manager">Manager</option>
+                          <option value="admin">Admin</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Reports To</label>
+                        <select value={empForm.managerId} onChange={e => setEmpForm(f => ({ ...f, managerId: e.target.value }))} style={S.inputBase}>
+                          <option value="">No manager</option>
+                          {employees.filter(e => e.id !== editingEmpId && (e.role === "manager" || e.role === "admin")).map(e => (
+                            <option key={e.id} value={e.id}>{e.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 10 }}>
+                      <button style={S.btnDark} className="btn-anim" onClick={() => {
+                        if (!empForm.name || !empForm.email) return showToast("Name and email are required", "error");
+                        const initials = empForm.name.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
+                        if (editingEmpId) {
+                          setEmployees(prev => prev.map(e => e.id === editingEmpId ? { ...e, ...empForm, managerId: empForm.managerId ? parseInt(empForm.managerId) : null, avatar: initials } : e));
+                          showToast("Employee updated!");
+                        } else {
+                          const newId = Math.max(...employees.map(e => e.id)) + 1;
+                          const newEmp = { id: newId, ...empForm, managerId: empForm.managerId ? parseInt(empForm.managerId) : null, avatar: initials };
+                          setEmployees(prev => [...prev, newEmp]);
+                          setBalances(prev => ({ ...prev, [newId]: { ...DEFAULT_ENTITLEMENTS } }));
+                          showToast(`${empForm.name} added!`);
+                        }
+                        setShowEmpForm(false); setEditingEmpId(null);
+                      }}>{editingEmpId ? "Save Changes" : "Add Employee"}</button>
+                      <button style={S.btnOutline} className="btn-anim" onClick={() => { setShowEmpForm(false); setEditingEmpId(null); }}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Employee list */}
+                <div style={S.card}>
+                  {employees.map((emp, i) => {
+                    const manager = employees.find(e => e.id === emp.managerId);
+                    return (
+                      <div key={emp.id} className="row-hover" style={{ padding: "16px 24px", borderBottom: i < employees.length - 1 ? "1px solid #f6f6f6" : "none", display: "flex", alignItems: "center", gap: 14 }}>
+                        <Avatar initials={emp.avatar} size={40} />
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontWeight: 600, fontSize: 14 }}>{emp.name}</div>
+                          <div style={{ fontSize: 12, color: "#888", marginTop: 2 }}>{emp.title} · {emp.dept}</div>
+                          <div style={{ fontSize: 11, color: "#aaa", marginTop: 2, fontFamily: "'DM Mono', monospace" }}>
+                            {emp.email} · <span style={{ color: emp.role === "admin" ? "#7c3aed" : emp.role === "manager" ? "#1a73e8" : "#aaa" }}>{emp.role}</span>
+                            {manager && <span> · Reports to {manager.name}</span>}
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button className="btn-anim" style={{ ...S.btnOutline, padding: "7px 14px", fontSize: 12 }} onClick={() => {
+                            setEditingEmpId(emp.id);
+                            setEmpForm({ name: emp.name, email: emp.email, dept: emp.dept, title: emp.title, role: emp.role, managerId: emp.managerId || "" });
+                            setShowEmpForm(true);
+                          }}>Edit</button>
+                          <button className="btn-anim" style={{ ...S.btnRed, padding: "7px 14px", fontSize: 12 }} onClick={() => {
+                            if (employees.length <= 1) return showToast("Cannot remove the last employee", "error");
+                            if (emp.id === currentUser.id) return showToast("Cannot remove yourself", "error");
+                            setEmployees(prev => prev.filter(e => e.id !== emp.id));
+                            showToast(`${emp.name} removed`);
+                          }}>Remove</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
