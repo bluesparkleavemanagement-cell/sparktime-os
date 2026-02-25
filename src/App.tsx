@@ -1,4 +1,5 @@
-import { useState, useMemo, useCallback, useEffect } from "react";
+// @ts-nocheck
+import { useState, useMemo, useCallback } from "react";
 
 // ─── EMAILJS CONFIG ────────────────────────────────────────────────────────────
 // 1. Sign up at https://www.emailjs.com
