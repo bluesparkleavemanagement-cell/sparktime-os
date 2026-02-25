@@ -1,5 +1,22 @@
 // @ts-nocheck
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useEffect } from "react";
+
+// ─── FIREBASE CONFIG ───────────────────────────────────────────────────────────
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyC-kisuXUSzFJoniNjKY5ADviWRsgql7gA",
+  authDomain: "sparktime-os-a2bd2.firebaseapp.com",
+  projectId: "sparktime-os-a2bd2",
+  storageBucket: "sparktime-os-a2bd2.firebasestorage.app",
+  messagingSenderId: "136746772985",
+  appId: "1:136746772985:web:83ed83f803f9f0f10f3528",
+};
+
+// Firebase loaded via npm (installed in package.json)
+import { initializeApp } from "firebase/app";
+import { getFirestore, collection, doc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, getDoc } from "firebase/firestore";
+
+const firebaseApp = initializeApp(FIREBASE_CONFIG);
+const db = getFirestore(firebaseApp);
 
 // ─── EMAILJS CONFIG ────────────────────────────────────────────────────────────
 // 1. Sign up at https://www.emailjs.com
@@ -31,8 +48,8 @@ const INITIAL_EMPLOYEES = [
   { id: 3, name: "Priya Patel",      email: "priya@company.com",   dept: "Marketing",   role: "employee", avatar: "PP", managerId: 6, title: "Marketing Lead" },
   { id: 4, name: "James O'Brien",    email: "james@company.com",   dept: "Engineering", role: "employee", avatar: "JO", managerId: 5, title: "Engineer" },
   { id: 5, name: "Elena Rodriguez",  email: "elena@company.com",   dept: "Engineering", role: "manager",  avatar: "ER", managerId: 7, title: "Eng Manager" },
-  { id: 6, name: "David Kim",        email: "david@company.com",   dept: "Operations",  role: "manager",  avatar: "DK", managerId: 7, title: "Ops Manager" },
-  { id: 7, name: "Alex Thompson",    email: "alex@company.com",    dept: "Executive",   role: "admin",    avatar: "AT", managerId: null, title: "CEO" },
+  { id: 6, name: "Renadel Molina",   email: "renadel.molina@bluesparkph.com", dept: "Operations", role: "manager", avatar: "RM", managerId: 7, title: "Ops Manager" },
+  { id: 7, name: "Ana Isla",          email: "afb.isla@bluesparkph.com",       dept: "Executive",  role: "admin",   avatar: "AI", managerId: null, title: "CEO" },
 ];
 
 const LEAVE_TYPES = ["Vacation Leave", "Sick Leave", "Offset", "Bereavement Leave", "Emergency Leave", "Parental Leave (Maternity or Paternity)"];
@@ -280,11 +297,16 @@ function OrgNode({ node, depth = 0, employees, onUpdateManager, editable }) {
 
 // ─── MAIN APP ──────────────────────────────────────────────────────────────────
 export default function App() {
+  // ── Firebase-backed state ──
   const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
+  const [requests, setRequests] = useState([]);
+  const [balances, setBalances] = useState(INITIAL_BALANCES);
+  const [entitlements, setEntitlements] = useState({ ...DEFAULT_ENTITLEMENTS });
+  const [dbReady, setDbReady] = useState(false);
+
+  // ── UI state ──
   const [currentUser, setCurrentUser] = useState(INITIAL_EMPLOYEES[0]);
   const [view, setView] = useState("dashboard");
-  const [requests, setRequests] = useState(INITIAL_REQUESTS);
-  const [balances, setBalances] = useState(INITIAL_BALANCES);
   const [showForm, setShowForm] = useState(false);
   const [calMonth, setCalMonth] = useState(new Date(2026, 2, 1));
   const [reviewModal, setReviewModal] = useState(null);
@@ -293,20 +315,76 @@ export default function App() {
   const [gcalLoading, setGcalLoading] = useState({});
   const [orgEditable, setOrgEditable] = useState(false);
   const [emailStatus, setEmailStatus] = useState(null);
-  const [entitlements, setEntitlements] = useState({ ...DEFAULT_ENTITLEMENTS });
   const [entitlementDraft, setEntitlementDraft] = useState({ ...DEFAULT_ENTITLEMENTS });
   const [entitlementSaved, setEntitlementSaved] = useState(false);
   const [selectedEmpId, setSelectedEmpId] = useState(null);
   const [empBalanceDraft, setEmpBalanceDraft] = useState({});
   const [empBalanceSaved, setEmpBalanceSaved] = useState(false);
   const [form, setForm] = useState({ type: "Vacation Leave", start: "", end: "", reason: "" });
-  const [loggedInUser, setLoggedInUser] = useState(null); // null = not logged in
+  const [empForm, setEmpForm] = useState({ name: "", email: "", dept: "", title: "", role: "employee", managerId: "" });
+  const [showEmpForm, setShowEmpForm] = useState(false);
+  const [editingEmpId, setEditingEmpId] = useState(null);
+  const [loggedInUser, setLoggedInUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  // ── Firebase real-time listeners ──
+  useEffect(() => {
+    // Seed employees if Firestore is empty, then listen
+    const empCol = collection(db, "employees");
+    const unsubEmp = onSnapshot(empCol, async (snap) => {
+      if (snap.empty) {
+        // First run: seed initial employees
+        for (const emp of INITIAL_EMPLOYEES) {
+          await setDoc(doc(db, "employees", String(emp.id)), emp);
+        }
+      } else {
+        const emps = snap.docs.map(d => ({ ...d.data(), id: Number(d.id) || d.id }));
+        setEmployees(emps);
+        // Update currentUser if their record changed
+        setCurrentUser(prev => emps.find(e => e.id === prev.id) || prev);
+        setLoggedInUser(prev => prev ? (emps.find(e => e.id === prev.id) || prev) : null);
+      }
+    });
+
+    // Listen to requests
+    const unsubReqs = onSnapshot(collection(db, "requests"), (snap) => {
+      const reqs = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+      setRequests(reqs);
+    });
+
+    // Listen to balances
+    const unsubBal = onSnapshot(collection(db, "balances"), async (snap) => {
+      if (snap.empty) {
+        // Seed initial balances
+        for (const [empId, bal] of Object.entries(INITIAL_BALANCES)) {
+          await setDoc(doc(db, "balances", String(empId)), bal);
+        }
+      } else {
+        const bals = {};
+        snap.docs.forEach(d => { bals[Number(d.id) || d.id] = d.data(); });
+        setBalances(bals);
+      }
+    });
+
+    // Listen to settings (entitlements)
+    const unsubSettings = onSnapshot(doc(db, "settings", "entitlements"), async (snap) => {
+      if (!snap.exists()) {
+        await setDoc(doc(db, "settings", "entitlements"), DEFAULT_ENTITLEMENTS);
+      } else {
+        const data = snap.data();
+        setEntitlements(data);
+        setEntitlementDraft(data);
+      }
+    });
+
+    setDbReady(true);
+    return () => { unsubEmp(); unsubReqs(); unsubBal(); unsubSettings(); };
   }, []);
 
   // ── GOOGLE SIGN IN ──
@@ -346,7 +424,7 @@ export default function App() {
                     headers: { Authorization: `Bearer ${resp.access_token}` }
                   });
                   const info = await res.json();
-                  const matched = INITIAL_EMPLOYEES.find(e => e.email.toLowerCase() === info.email?.toLowerCase());
+                  const matched = employees.find(e => e.email.toLowerCase() === info.email?.toLowerCase());
                   if (!matched) {
                     setAuthError(`No account found for ${info.email}. Contact your admin.`);
                     setAuthLoading(false);
@@ -390,29 +468,28 @@ export default function App() {
     if (window.google?.accounts?.id) window.google.accounts.id.disableAutoSelect();
   }, []);
 
-  const saveEntitlements = useCallback(() => {
-    setEntitlements(prev => {
-      const next = { ...entitlementDraft };
-      setBalances(prevB => {
-        const nextB = { ...prevB };
-        Object.keys(nextB).forEach(empId => {
-          const updated = { ...nextB[empId] };
-          LEAVE_TYPES.forEach(lt => {
-            if ((entitlementDraft[lt] || 0) > (prev[lt] || 0)) {
-              const diff = (entitlementDraft[lt] || 0) - (prev[lt] || 0);
-              updated[lt] = (updated[lt] || 0) + diff;
-            }
-          });
-          nextB[empId] = updated;
-        });
-        return nextB;
+  const saveEntitlements = useCallback(async () => {
+    // Save to Firestore settings
+    await setDoc(doc(db, "settings", "entitlements"), entitlementDraft);
+
+    // Update each employee's balance for increases
+    for (const [empId, bal] of Object.entries(balances)) {
+      const updated = { ...bal };
+      let changed = false;
+      LEAVE_TYPES.forEach(lt => {
+        if ((entitlementDraft[lt] || 0) > (entitlements[lt] || 0)) {
+          const diff = (entitlementDraft[lt] || 0) - (entitlements[lt] || 0);
+          updated[lt] = (updated[lt] || 0) + diff;
+          changed = true;
+        }
       });
-      return next;
-    });
+      if (changed) await updateDoc(doc(db, "balances", String(empId)), updated);
+    }
+
     setEntitlementSaved(true);
     setTimeout(() => setEntitlementSaved(false), 2500);
     showToast("Entitlements updated for all employees!");
-  }, [entitlementDraft, showToast]);
+  }, [entitlementDraft, entitlements, balances, showToast]);
 
   const myRequests = requests.filter(r => r.employeeId === currentUser.id);
   const myBalance = balances[currentUser.id] || {};
@@ -433,9 +510,10 @@ export default function App() {
     if (days <= 0) return showToast("Invalid date range", "error");
     if ((myBalance[form.type] || 0) < days) return showToast("Insufficient leave balance", "error");
 
-    const newReq = { id: Date.now(), employeeId: currentUser.id, type: form.type, start: form.start, end: form.end, days, reason: form.reason, status: "pending", submittedAt: new Date().toISOString().split("T")[0], gcalSynced: false };
-    setRequests(prev => [newReq, ...prev]);
-    setForm({ type: "Annual Leave", start: "", end: "", reason: "" });
+    const newReq = { employeeId: currentUser.id, type: form.type, start: form.start, end: form.end, days, reason: form.reason, status: "pending", submittedAt: new Date().toISOString().split("T")[0], gcalSynced: false };
+    const docRef = await addDoc(collection(db, "requests"), newReq);
+    newReq.id = docRef.id;
+    setForm({ type: "Vacation Leave", start: "", end: "", reason: "" });
     setShowForm(false);
     showToast("Request submitted!");
 
@@ -452,13 +530,22 @@ export default function App() {
   // Review request
   const reviewRequest = async (decision) => {
     const r = reviewModal;
-    setRequests(prev => prev.map(req => {
-      if (req.id !== r.id) return req;
-      if (decision === "approved") {
-        setBalances(prev2 => ({ ...prev2, [req.employeeId]: { ...prev2[req.employeeId], [req.type]: (prev2[req.employeeId]?.[req.type] || 0) - req.days } }));
+    // Update request in Firestore
+    await updateDoc(doc(db, "requests", String(r.id)), {
+      status: decision,
+      reviewedBy: currentUser.id,
+      reviewNote: reviewNote || "",
+    });
+
+    // Deduct balance if approved
+    if (decision === "approved") {
+      const empBalRef = doc(db, "balances", String(r.employeeId));
+      const empBalSnap = await getDoc(empBalRef);
+      if (empBalSnap.exists()) {
+        const current = empBalSnap.data()[r.type] || 0;
+        await updateDoc(empBalRef, { [r.type]: Math.max(0, current - r.days) });
       }
-      return { ...req, status: decision, reviewedBy: currentUser.id, reviewNote };
-    }));
+    }
 
     // Email employee
     const emp = employees.find(e => e.id === r.employeeId);
@@ -481,7 +568,7 @@ export default function App() {
     const result = await syncToGoogleCalendar(emp, request);
     setGcalLoading(p => ({ ...p, [request.id]: false }));
     if (result?.success) {
-      setRequests(prev => prev.map(r => r.id === request.id ? { ...r, gcalSynced: true } : r));
+      await updateDoc(doc(db, "requests", String(request.id)), { gcalSynced: true });
       showToast(result.mock ? "📅 (Mock) Added to Google Calendar!" : "📅 Added to Google Calendar!");
     } else {
       showToast("Google Calendar sync failed", "error");
@@ -489,10 +576,11 @@ export default function App() {
   };
 
   // Org chart
-  const updateManagerId = useCallback((empId, managerId) => {
-    setEmployees(prev => prev.map(e => e.id === empId ? { ...e, managerId } : e));
+  const updateManagerId = useCallback(async (empId, managerId) => {
+    const emp = employees.find(e => e.id === empId);
+    if (emp) await updateDoc(doc(db, "employees", String(empId)), { managerId });
     showToast("Reporting line updated");
-  }, [showToast]);
+  }, [employees, showToast]);
 
   const orgTree = useMemo(() => buildOrgTree(employees), [employees]);
 
@@ -535,6 +623,17 @@ export default function App() {
     ...(isManager ? [{ id: "approvals", label: `Approvals${pendingForMe.length > 0 ? ` (${pendingForMe.length})` : ""}`, icon: "◎" }] : []),
     ...(isAdmin   ? [{ id: "employees", label: "Employees", icon: "◫" }, { id: "orgchart",  label: "Org Chart Builder", icon: "⬡" }, { id: "entitlements", label: "Leave Entitlements", icon: "◇" }] : []),
   ];
+
+  // ── LOADING SCREEN ──
+  if (!dbReady) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16 }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap');`}</style>
+        <div style={{ fontFamily: "'DM Mono', monospace", color: "#fff", fontSize: 22, fontWeight: 500 }}>SparkTime OS</div>
+        <div style={{ fontFamily: "'DM Mono', monospace", color: "rgba(255,255,255,0.35)", fontSize: 12 }}>Connecting...</div>
+      </div>
+    );
+  }
 
   // ── LOGIN SCREEN ──
   if (!loggedInUser) {
@@ -658,7 +757,7 @@ export default function App() {
           <div style={{ margin: "0 12px 18px", background: "rgba(255,255,255,0.05)", borderRadius: 12, padding: 12 }}>
             <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 9, fontFamily: "'DM Mono', monospace", marginBottom: 8, textTransform: "uppercase", letterSpacing: 1.5 }}>Signed in as</div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-              <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#4285F4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff", flexShrink: 0 }}>{currentUser.avatar}</div>
+              <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#4285F4", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#fff", flexShrink: 0 }}>{currentUser.avatar || currentUser.name?.slice(0,2).toUpperCase()}</div>
               <div>
                 <div style={{ color: "#fff", fontSize: 12, fontWeight: 600 }}>{currentUser.name}</div>
                 <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 10, fontFamily: "'DM Mono', monospace" }}>{currentUser.role}</div>
@@ -1056,8 +1155,8 @@ export default function App() {
                                 <div style={{ fontSize: 12, color: "#888" }}>{emp.title} · {emp.dept}</div>
                               </div>
                             </div>
-                            <button onClick={() => {
-                              setBalances(prev => ({ ...prev, [emp.id]: { ...draft } }));
+                            <button onClick={async () => {
+                              await setDoc(doc(db, "balances", String(emp.id)), { ...draft });
                               setEmpBalanceSaved(true);
                               setTimeout(() => setEmpBalanceSaved(false), 2500);
                               showToast(`Balances updated for ${emp.name}!`);
@@ -1117,7 +1216,7 @@ export default function App() {
                       {[["Full Name", "name", "text"], ["Email", "email", "email"], ["Department", "dept", "text"], ["Job Title", "title", "text"]].map(([label, key, type]) => (
                         <div key={key}>
                           <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>{label}</label>
-                          <input type={type} value={empForm[key]} onChange={e => setEmpForm(f => ({ ...f, [key]: e.target.value }))} style={S.inputBase} placeholder={label} />
+                          <input type={type} value={empForm[key] ?? ''} onChange={e => setEmpForm(f => ({ ...f, [key]: e.target.value }))} style={S.inputBase} placeholder={label} />
                         </div>
                       ))}
                       <div>
@@ -1139,17 +1238,18 @@ export default function App() {
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: 10 }}>
-                      <button style={S.btnDark} className="btn-anim" onClick={() => {
+                      <button style={S.btnDark} className="btn-anim" onClick={async () => {
                         if (!empForm.name || !empForm.email) return showToast("Name and email are required", "error");
                         const initials = empForm.name.split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
                         if (editingEmpId) {
-                          setEmployees(prev => prev.map(e => e.id === editingEmpId ? { ...e, ...empForm, managerId: empForm.managerId ? parseInt(empForm.managerId) : null, avatar: initials } : e));
+                          const updated = { ...empForm, managerId: empForm.managerId ? parseInt(empForm.managerId) : null, avatar: initials };
+                          await setDoc(doc(db, "employees", String(editingEmpId)), { ...employees.find(e => e.id === editingEmpId), ...updated });
                           showToast("Employee updated!");
                         } else {
                           const newId = Math.max(...employees.map(e => e.id)) + 1;
                           const newEmp = { id: newId, ...empForm, managerId: empForm.managerId ? parseInt(empForm.managerId) : null, avatar: initials };
-                          setEmployees(prev => [...prev, newEmp]);
-                          setBalances(prev => ({ ...prev, [newId]: { ...DEFAULT_ENTITLEMENTS } }));
+                          await setDoc(doc(db, "employees", String(newId)), newEmp);
+                          await setDoc(doc(db, "balances", String(newId)), { ...entitlements });
                           showToast(`${empForm.name} added!`);
                         }
                         setShowEmpForm(false); setEditingEmpId(null);
@@ -1165,7 +1265,7 @@ export default function App() {
                     const manager = employees.find(e => e.id === emp.managerId);
                     return (
                       <div key={emp.id} className="row-hover" style={{ padding: "16px 24px", borderBottom: i < employees.length - 1 ? "1px solid #f6f6f6" : "none", display: "flex", alignItems: "center", gap: 14 }}>
-                        <Avatar initials={emp.avatar} size={40} />
+                        <Avatar initials={emp.avatar || emp.name?.slice(0,2).toUpperCase() || "??"} size={40} />
                         <div style={{ flex: 1 }}>
                           <div style={{ fontWeight: 600, fontSize: 14 }}>{emp.name}</div>
                           <div style={{ fontSize: 12, color: "#888", marginTop: 2 }}>{emp.title} · {emp.dept}</div>
@@ -1180,10 +1280,11 @@ export default function App() {
                             setEmpForm({ name: emp.name, email: emp.email, dept: emp.dept, title: emp.title, role: emp.role, managerId: emp.managerId || "" });
                             setShowEmpForm(true);
                           }}>Edit</button>
-                          <button className="btn-anim" style={{ ...S.btnRed, padding: "7px 14px", fontSize: 12 }} onClick={() => {
+                          <button className="btn-anim" style={{ ...S.btnRed, padding: "7px 14px", fontSize: 12 }} onClick={async () => {
                             if (employees.length <= 1) return showToast("Cannot remove the last employee", "error");
                             if (emp.id === currentUser.id) return showToast("Cannot remove yourself", "error");
-                            setEmployees(prev => prev.filter(e => e.id !== emp.id));
+                            await deleteDoc(doc(db, "employees", String(emp.id)));
+                            await deleteDoc(doc(db, "balances", String(emp.id)));
                             showToast(`${emp.name} removed`);
                           }}>Remove</button>
                         </div>
