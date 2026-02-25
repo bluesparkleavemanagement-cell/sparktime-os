@@ -300,6 +300,9 @@ export default function App() {
   const [empBalanceDraft, setEmpBalanceDraft] = useState({});
   const [empBalanceSaved, setEmpBalanceSaved] = useState(false);
   const [form, setForm] = useState({ type: "Vacation Leave", start: "", end: "", reason: "" });
+  const [empForm, setEmpForm] = useState({ name: "", email: "", dept: "", title: "", role: "employee", managerId: "" });
+  const [showEmpForm, setShowEmpForm] = useState(false);
+  const [editingEmpId, setEditingEmpId] = useState(null);
   const [loggedInUser, setLoggedInUser] = useState(null); // null = not logged in
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
