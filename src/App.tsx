@@ -31,8 +31,8 @@ const INITIAL_EMPLOYEES = [
   { id: 3, name: "Priya Patel",      email: "priya@company.com",   dept: "Marketing",   role: "employee", avatar: "PP", managerId: 6, title: "Marketing Lead" },
   { id: 4, name: "James O'Brien",    email: "james@company.com",   dept: "Engineering", role: "employee", avatar: "JO", managerId: 5, title: "Engineer" },
   { id: 5, name: "Elena Rodriguez",  email: "elena@company.com",   dept: "Engineering", role: "manager",  avatar: "ER", managerId: 7, title: "Eng Manager" },
-  { id: 6, name: "David Kim",        email: "david@company.com",   dept: "Operations",  role: "manager",  avatar: "DK", managerId: 7, title: "Ops Manager" },
-  { id: 7, name: "Alex Thompson",    email: "alex@company.com",    dept: "Executive",   role: "admin",    avatar: "AT", managerId: null, title: "CEO" },
+  { id: 6, name: "Renadel Molina",        email: "renadel.molina@bluesparkph.com",   dept: "Operations",  role: "manager",  avatar: "DK", managerId: 7, title: "Ops Manager" },
+  { id: 7, name: "Ana Isla",    email: "afb.isla@bluesparkph.com",    dept: "Executive",   role: "admin",    avatar: "AI", managerId: null, title: "CEO" },
 ];
 
 const LEAVE_TYPES = ["Vacation Leave", "Sick Leave", "Offset", "Bereavement Leave", "Emergency Leave", "Parental Leave (Maternity or Paternity)"];
