@@ -84,17 +84,33 @@ const TYPE_COLORS = {
 };
 
 const STATUS_STYLES = {
-  pending:  { bg: "#fff8e1", text: "#f59e0b", label: "Pending" },
-  approved: { bg: "#e6f4ea", text: "#188038", label: "Approved" },
-  rejected: { bg: "#fce8e6", text: "#d93025", label: "Rejected" },
+  pending:   { bg: "#fff8e1", text: "#f59e0b", label: "Pending" },
+  approved:  { bg: "#e6f4ea", text: "#188038", label: "Approved" },
+  rejected:  { bg: "#fce8e6", text: "#d93025", label: "Rejected" },
+  cancelled: { bg: "#f1f3f4", text: "#5f6368", label: "Cancelled" },
 };
 
 // ─── UTILITIES ─────────────────────────────────────────────────────────────────
-function getDaysBetween(start, end) {
-  const s = new Date(start), e = new Date(end);
+// Leave types that count ALL calendar days (including weekends)
+const CALENDAR_DAY_TYPES = ["Parental Leave (Maternity or Paternity)"];
+
+function getDaysBetween(start, end, leaveType = "") {
+  const s = new Date(start + "T00:00:00");
+  const e = new Date(end + "T00:00:00");
+  if (e < s) return 0;
+  const countWeekends = CALENDAR_DAY_TYPES.includes(leaveType);
+  if (countWeekends) {
+    // Count all calendar days inclusive
+    return Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1;
+  }
   let count = 0, cur = new Date(s);
   while (cur <= e) { if (cur.getDay() !== 0 && cur.getDay() !== 6) count++; cur.setDate(cur.getDate() + 1); }
   return count;
+}
+
+// Format days nicely (supports 0.5)
+function formatDays(d) {
+  return d === 0.5 ? "½ day" : d === 1 ? "1 day" : `${d} days`;
 }
 
 function buildOrgTree(employees) {
@@ -142,6 +158,19 @@ async function notifyEmployee(employee, manager, request, status, note) {
     leave_type: request.type, start: request.start, end: request.end,
     days: request.days, status, review_note: note || "—", manager_name: manager.name,
   });
+}
+
+// ─── AUDIT LOG ────────────────────────────────────────────────────────────────
+async function logAudit(db, action, actor, details) {
+  try {
+    await addDoc(collection(db, "auditLog"), {
+      action,
+      actorId: actor.id,
+      actorName: actor.name,
+      details,
+      timestamp: new Date().toISOString(),
+    });
+  } catch(e) { console.error("Audit log failed", e); }
 }
 
 // ─── GOOGLE CALENDAR (OAUTH) ───────────────────────────────────────────────────
@@ -320,13 +349,14 @@ export default function App() {
   const [selectedEmpId, setSelectedEmpId] = useState(null);
   const [empBalanceDraft, setEmpBalanceDraft] = useState({});
   const [empBalanceSaved, setEmpBalanceSaved] = useState(false);
-  const [form, setForm] = useState({ type: "Vacation Leave", start: "", end: "", reason: "" });
+  const [form, setForm] = useState({ type: "Vacation Leave", start: "", end: "", reason: "", isHalfDay: false });
   const [empForm, setEmpForm] = useState({ name: "", email: "", dept: "", title: "", role: "employee", managerId: "" });
   const [showEmpForm, setShowEmpForm] = useState(false);
   const [editingEmpId, setEditingEmpId] = useState(null);
   const [loggedInUser, setLoggedInUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [auditLogs, setAuditLogs] = useState([]);
 
   const showToast = useCallback((msg, type = "success") => {
     setToast({ msg, type });
@@ -394,7 +424,14 @@ export default function App() {
         }
       });
 
+      // Listen to audit log
+      const unsubAudit = onSnapshot(collection(db, "auditLog"), (snap) => {
+        const logs = snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+        setAuditLogs(logs);
+      });
+
       setDbReady(true);
+      return unsubAudit;
     };
 
     init();
@@ -525,16 +562,18 @@ export default function App() {
   // Submit leave
   const submitLeave = async () => {
     if (!form.start || !form.end || !form.reason.trim()) return showToast("Please fill all fields", "error");
-    const days = getDaysBetween(form.start, form.end);
+    let days = form.isHalfDay ? 0.5 : getDaysBetween(form.start, form.end, form.type);
     if (days <= 0) return showToast("Invalid date range", "error");
-    if ((myBalance[form.type] || 0) < days) return showToast("Insufficient leave balance", "error");
+    const currentBalance = myBalance[form.type] ?? 0;
+    if (currentBalance < days) return showToast(`Insufficient balance — you have ${formatDays(currentBalance)} of ${form.type} remaining`, "error");
 
-    const newReq = { employeeId: currentUser.id, type: form.type, start: form.start, end: form.end, days, reason: form.reason, status: "pending", submittedAt: new Date().toISOString().split("T")[0], gcalSynced: false };
+    const newReq = { employeeId: currentUser.id, type: form.type, start: form.start, end: form.end, days, isHalfDay: form.isHalfDay || false, reason: form.reason, status: "pending", submittedAt: new Date().toISOString().split("T")[0], gcalSynced: false };
     const docRef = await addDoc(collection(db, "requests"), newReq);
     newReq.id = docRef.id;
-    setForm({ type: "Vacation Leave", start: "", end: "", reason: "" });
+    setForm({ type: "Vacation Leave", start: "", end: "", reason: "", isHalfDay: false });
     setShowForm(false);
     showToast("Request submitted!");
+    await logAudit(db, "LEAVE_FILED", currentUser, { requestId: docRef.id, type: form.type, days, start: form.start, end: form.end });
 
     // Email manager
     const manager = employees.find(e => e.id === currentUser.managerId);
@@ -575,9 +614,26 @@ export default function App() {
       setTimeout(() => setEmailStatus(null), 4000);
     }
 
+    await logAudit(db, decision === "approved" ? "LEAVE_APPROVED" : "LEAVE_REJECTED", currentUser, { requestId: String(r.id), employeeId: r.employeeId, type: r.type, days: r.days, note: reviewNote || "" });
     setReviewModal(null);
     setReviewNote("");
     showToast(`Request ${decision}!`);
+  };
+
+  // Cancel leave
+  const cancelLeave = async (request) => {
+    await updateDoc(doc(db, "requests", String(request.id)), { status: "cancelled" });
+    // Refund balance if was approved
+    if (request.status === "approved") {
+      const empBalRef = doc(db, "balances", String(request.employeeId));
+      const empBalSnap = await getDoc(empBalRef);
+      if (empBalSnap.exists()) {
+        const current = empBalSnap.data()[request.type] || 0;
+        await updateDoc(empBalRef, { [request.type]: current + request.days });
+      }
+    }
+    await logAudit(db, "LEAVE_CANCELLED", currentUser, { requestId: String(request.id), type: request.type, days: request.days });
+    showToast("Leave request cancelled");
   };
 
   // GCal sync
@@ -640,7 +696,7 @@ export default function App() {
     { id: "calendar",  label: "Calendar",   icon: "⬡" },
     { id: "org",       label: "Organization", icon: "◉" },
     ...(isManager ? [{ id: "approvals", label: `Approvals${pendingForMe.length > 0 ? ` (${pendingForMe.length})` : ""}`, icon: "◎" }] : []),
-    ...(isAdmin   ? [{ id: "employees", label: "Employees", icon: "◫" }, { id: "orgchart",  label: "Org Chart Builder", icon: "⬡" }, { id: "entitlements", label: "Leave Entitlements", icon: "◇" }] : []),
+    ...(isAdmin   ? [{ id: "employees", label: "Employees", icon: "◫" }, { id: "orgchart",  label: "Org Chart Builder", icon: "⬡" }, { id: "entitlements", label: "Leave Entitlements", icon: "◇" }, { id: "auditlog", label: "Audit Log", icon: "◎" }] : []),
   ];
 
   // ── LOADING SCREEN ──
@@ -881,24 +937,53 @@ export default function App() {
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
                       <div style={{ gridColumn: "1/-1" }}>
                         <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Leave Type</label>
-                        <select value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value }))} style={S.inputBase}>
+                        <select value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value, isHalfDay: false }))} style={S.inputBase}>
                           {LEAVE_TYPES.map(lt => <option key={lt}>{lt}</option>)}
                         </select>
-                        <div style={{ fontSize: 11, color: "#aaa", marginTop: 5, fontFamily: "'DM Mono', monospace" }}>Available balance: <strong>{myBalance[form.type] || 0} days</strong></div>
+                        {(() => {
+                          const bal = myBalance[form.type] ?? 0;
+                          const isLow = bal <= 2 && bal > 0;
+                          const isEmpty = bal === 0;
+                          return (
+                            <div style={{ fontSize: 11, marginTop: 5, fontFamily: "'DM Mono', monospace", color: isEmpty ? "#d93025" : isLow ? "#e65100" : "#aaa" }}>
+                              Available: <strong>{formatDays(bal)}</strong>
+                              {isEmpty && " — ⚠️ No balance remaining"}
+                              {isLow && !isEmpty && " — ⚠️ Low balance"}
+                              {CALENDAR_DAY_TYPES.includes(form.type) && <span style={{ marginLeft: 8, color: "#888" }}>(counts all calendar days incl. weekends)</span>}
+                            </div>
+                          );
+                        })()}
                       </div>
                       <div>
                         <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Start Date</label>
                         <input type="date" value={form.start} onChange={e => setForm(f => ({ ...f, start: e.target.value }))} style={S.inputBase} />
                       </div>
                       <div>
-                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>End Date</label>
-                        <input type="date" value={form.end} onChange={e => setForm(f => ({ ...f, end: e.target.value }))} style={S.inputBase} />
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>End Date {form.isHalfDay && <span style={{ color: "#1a73e8", fontStyle: "italic" }}>(same as start for half day)</span>}</label>
+                        <input type="date" value={form.isHalfDay ? form.start : form.end} disabled={form.isHalfDay} onChange={e => setForm(f => ({ ...f, end: e.target.value }))} style={{ ...S.inputBase, opacity: form.isHalfDay ? 0.5 : 1 }} />
                       </div>
-                      {form.start && form.end && getDaysBetween(form.start, form.end) > 0 && (
-                        <div style={{ gridColumn: "1/-1", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 10, padding: "10px 14px", fontSize: 13, fontFamily: "'DM Mono', monospace", color: "#166534" }}>
-                          📅 {getDaysBetween(form.start, form.end)} working day(s) selected
-                        </div>
-                      )}
+
+                      {/* Half day checkbox */}
+                      <div style={{ gridColumn: "1/-1" }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", userSelect: "none" }}>
+                          <input type="checkbox" checked={form.isHalfDay} onChange={e => setForm(f => ({ ...f, isHalfDay: e.target.checked, end: e.target.checked ? f.start : f.end }))}
+                            style={{ width: 16, height: 16, cursor: "pointer", accentColor: "#1a1a2e" }} />
+                          <span style={{ fontSize: 13, color: "#444", fontWeight: 500 }}>Half day <span style={{ color: "#aaa", fontSize: 12 }}>(0.5 days will be deducted)</span></span>
+                        </label>
+                      </div>
+
+                      {/* Days preview */}
+                      {form.start && (form.isHalfDay || form.end) && (() => {
+                        const days = form.isHalfDay ? 0.5 : getDaysBetween(form.start, form.end, form.type);
+                        const bal = myBalance[form.type] ?? 0;
+                        const insufficient = bal < days;
+                        return days > 0 ? (
+                          <div style={{ gridColumn: "1/-1", background: insufficient ? "#fce8e6" : "#f0fdf4", border: `1px solid ${insufficient ? "#fca5a5" : "#bbf7d0"}`, borderRadius: 10, padding: "10px 14px", fontSize: 13, fontFamily: "'DM Mono', monospace", color: insufficient ? "#d93025" : "#166534" }}>
+                            {insufficient ? "⚠️" : "📅"} {formatDays(days)} selected · {insufficient ? `Insufficient balance (have ${formatDays(bal)})` : `${formatDays(bal - days)} will remain after`}
+                          </div>
+                        ) : null;
+                      })()}
+
                       <div style={{ gridColumn: "1/-1" }}>
                         <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", textTransform: "uppercase", letterSpacing: 1 }}>Reason</label>
                         <textarea value={form.reason} onChange={e => setForm(f => ({ ...f, reason: e.target.value }))} placeholder="Briefly describe your reason..." style={{ ...S.inputBase, height: 80, resize: "none" }} />
@@ -924,12 +1009,15 @@ export default function App() {
                             {r.reviewNote && <div style={{ marginTop: 8, fontSize: 12, color: "#888", fontStyle: "italic", background: "#f8f8f8", padding: "6px 10px", borderRadius: 8, display: "inline-block" }}>💬 {r.reviewNote}</div>}
                           </div>
                           <div style={{ textAlign: "right", flexShrink: 0 }}>
-                            <div style={{ fontSize: 24, fontWeight: 700, fontFamily: "'DM Mono', monospace", color: "#1a1a2e" }}>{r.days}</div>
-                            <div style={{ fontSize: 10, color: "#aaa", fontFamily: "'DM Mono', monospace" }}>days</div>
+                            <div style={{ fontSize: 24, fontWeight: 700, fontFamily: "'DM Mono', monospace", color: "#1a1a2e" }}>{formatDays(r.days)}</div>
+                            {r.isHalfDay && <div style={{ fontSize: 9, color: "#1a73e8", fontFamily: "'DM Mono', monospace", fontWeight: 700 }}>HALF DAY</div>}
                             {r.status === "approved" && (
                               <div style={{ marginTop: 8 }}>
                                 <GCalBadge synced={r.gcalSynced} loading={gcalLoading[r.id]} onSync={() => syncGCal(r)} />
                               </div>
+                            )}
+                            {(r.status === "pending") && (
+                              <button onClick={() => cancelLeave(r)} style={{ ...S.btnRed, marginTop: 8, padding: "5px 12px", fontSize: 11 }} className="btn-anim">Cancel</button>
                             )}
                           </div>
                         </div>
@@ -965,12 +1053,12 @@ export default function App() {
                           <div key={i} style={{ minHeight: 74, padding: 6, borderRadius: 10, background: isToday ? "#1a1a2e" : isWeekend ? "#fafafa" : "#fff", border: isToday ? "none" : "1px solid #f0f0f0" }}>
                             {date && <>
                               <div style={{ fontSize: 12, fontFamily: "'DM Mono', monospace", color: isToday ? "#fff" : isWeekend ? "#ccc" : "#444", fontWeight: isToday ? 700 : 400, marginBottom: 4 }}>{date.getDate()}</div>
-                              {leaves.slice(0, 2).map((r, j) => {
+                              {leaves.slice(0, 3).map((r, j) => {
                                 const emp = employees.find(e => e.id === r.employeeId);
-                                const c = TYPE_COLORS[r.type];
+                                const c = TYPE_COLORS[r.type] || TYPE_COLORS["Vacation Leave"];
                                 return <div key={j} title={`${emp?.name}: ${r.type}`} style={{ background: c.bg, color: c.text, fontSize: 9, borderRadius: 4, padding: "1px 5px", marginBottom: 2, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{emp?.name.split(" ")[0]}</div>;
                               })}
-                              {leaves.length > 2 && <div style={{ fontSize: 9, color: "#aaa", fontFamily: "'DM Mono', monospace" }}>+{leaves.length - 2}</div>}
+                              {leaves.length > 3 && <div style={{ fontSize: 9, color: "#aaa", fontFamily: "'DM Mono', monospace" }}>+{leaves.length - 3} more</div>}
                             </>}
                           </div>
                         );
@@ -1361,6 +1449,51 @@ export default function App() {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            )}
+
+            {/* ── AUDIT LOG (Admin only) ── */}
+            {view === "auditlog" && isAdmin && (
+              <div>
+                <div style={{ marginBottom: 26 }}>
+                  <div style={S.sectionLabel}>Admin Panel</div>
+                  <h1 style={S.pageTitle}>Audit Log</h1>
+                  <p style={{ color: "#888", fontSize: 14, marginTop: 4 }}>Full history of all leave actions — filings, approvals, rejections, cancellations, and admin changes.</p>
+                </div>
+                <div style={S.card}>
+                  {auditLogs.length === 0
+                    ? <div style={{ padding: 60, textAlign: "center", color: "#ccc", fontFamily: "'DM Mono', monospace", fontSize: 13 }}>No actions logged yet.</div>
+                    : auditLogs.map((log, i) => {
+                        const actionColors = {
+                          LEAVE_FILED: { bg: "#e8f4fd", text: "#1a73e8", label: "Filed" },
+                          LEAVE_APPROVED: { bg: "#e6f4ea", text: "#188038", label: "Approved" },
+                          LEAVE_REJECTED: { bg: "#fce8e6", text: "#d93025", label: "Rejected" },
+                          LEAVE_CANCELLED: { bg: "#f1f3f4", text: "#5f6368", label: "Cancelled" },
+                          EMPLOYEE_ADDED: { bg: "#f3e8fd", text: "#7c3aed", label: "Employee Added" },
+                          ENTITLEMENT_UPDATED: { bg: "#fff3e0", text: "#e65100", label: "Entitlement Updated" },
+                        };
+                        const style = actionColors[log.action] || { bg: "#f1f3f4", text: "#5f6368", label: log.action };
+                        const ts = new Date(log.timestamp);
+                        return (
+                          <div key={log.id} className="row-hover" style={{ padding: "16px 24px", borderBottom: i < auditLogs.length - 1 ? "1px solid #f6f6f6" : "none", display: "flex", alignItems: "center", gap: 14 }}>
+                            <div style={{ background: style.bg, color: style.text, fontSize: 10, fontWeight: 700, fontFamily: "'DM Mono', monospace", padding: "4px 10px", borderRadius: 20, flexShrink: 0, minWidth: 90, textAlign: "center" }}>{style.label}</div>
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 13, fontWeight: 600 }}>{log.actorName}</div>
+                              <div style={{ fontSize: 12, color: "#888", marginTop: 2 }}>
+                                {log.details?.type && <span>{log.details.type} · </span>}
+                                {log.details?.days && <span>{formatDays(log.details.days)} · </span>}
+                                {log.details?.start && <span>{log.details.start}{log.details.end && ` → ${log.details.end}`}</span>}
+                                {log.details?.note && <span style={{ fontStyle: "italic" }}> · "{log.details.note}"</span>}
+                              </div>
+                            </div>
+                            <div style={{ fontSize: 11, color: "#bbb", fontFamily: "'DM Mono', monospace", textAlign: "right", flexShrink: 0 }}>
+                              {ts.toLocaleDateString()}<br />{ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                            </div>
+                          </div>
+                        );
+                      })
+                  }
                 </div>
               </div>
             )}
